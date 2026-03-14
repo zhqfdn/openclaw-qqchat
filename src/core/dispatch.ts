@@ -1,0 +1,451 @@
+/**
+ * Message Dispatch Module
+ * Handles routing and dispatching incoming messages to the AI
+ */
+
+import {
+  type ReplyPayload,
+  buildPendingHistoryContextFromMap,
+  clearHistoryEntries,
+  recordPendingHistoryEntry,
+  resolveInboundRouteEnvelopeBuilderWithRuntime
+} from "openclaw/plugin-sdk";
+import type {
+  DispatchMessageMedia,
+  DispatchMessageParams,
+  OpenClawMessage,
+} from '../types';
+import {
+  getRuntime,
+  getContext,
+  getSession,
+  clearSession,
+  updateSession,
+  getLoginInfo,
+  historyCache
+} from './runtime.js'
+import { getFile, sendMsg, setInputStatus } from './request.js'
+import { napCatToOpenClawMessage, openClawToNapCatMessage } from '../adapters/message.js';
+import { Logger as log, markdownToText, buildMediaMessage } from '../utils/index.js';
+import { CHANNEL_ID } from "./config.js";
+
+/**
+ * Convert OpenClaw message content array to plain text
+ * For images, includes the URL so AI models can access them
+ * For replies, includes quoted message content if available
+ */
+async function contentToPlainText(content: OpenClawMessage[]): Promise<string> {
+  const results = await Promise.all(
+    content.map(async (c) => {
+      switch (c.type) {
+        case 'text':
+          return c.text;
+        case 'at':
+          const target = c.isAll ? '@全体成员' : `@${c.userId}`;
+          return `[AT]${target}`;
+        case 'image':
+          return `[图片]${c.url}`;
+        case 'audio':
+          return `[音频]${c.path}`;
+        case 'video':
+          return `[视频]${c.url}`;
+        case 'file': {
+          const fileInfo = await getFile({ file_id: c.fileId });
+          if (!fileInfo.data?.file) return null;
+          return `[文件]${fileInfo.data.file}`;
+        }
+        case 'json':
+          return `[JSON]\n\n\`\`\`json\n${c.data}\n\`\`\``;
+        case 'reply': {
+          const senderInfo = c.sender && c.senderId ? `${c.sender}(${c.senderId})` : '(未知用户)';
+          const replyMsg = c.message ?? '(无法获取原消息)';
+          const quotedContent = `${senderInfo}:\n${replyMsg}`.replace(/^/gm, '> ');
+          return `[回复]\n\n${quotedContent}`;
+        }
+        default:
+          return null;
+      }
+    })
+  );
+  return results.filter((v): v is string => v !== null).join('\n');
+}
+
+async function contextToMedia(content: OpenClawMessage[]): Promise<DispatchMessageMedia | undefined> {
+  const hasMedia = content.some(c => c.type === 'image' || c.type === 'audio' || c.type === 'file');
+  if (!hasMedia) {
+    return;
+  }
+  const image = content.find(c => c.type === 'image');
+  if (image) {
+    return {
+      type: 'image/jpeg',
+      path: image.url,
+      url: image.url,
+    };
+  }
+  const audio = content.find(c => c.type === 'audio');
+  if (audio) {
+    return {
+      type: 'audio/amr',
+      path: audio.path,
+      url: audio.url,
+    };
+  }
+  const file = content.find(c => c.type === 'file');
+  if (file) {
+    const fileInfo = await getFile({ file_id: file.fileId });
+    if (fileInfo.data?.file == undefined) {
+      return;
+    }
+    return {
+      type: 'application/octet-stream',
+      path: fileInfo.data?.file,
+      url: fileInfo.data?.url,
+    };
+  }
+  return;
+}
+
+async function sendText(isGroup: boolean, chatId: string, text: string): Promise<void> {
+  const cleanText = text.replace(/NO_REPLY\s*$/, '');
+  const messageSegments = [{ type: 'text', data: { text: markdownToText(cleanText) } }];
+
+  try {
+    await sendMsg({
+      message_type: isGroup ? 'group' : 'private',
+      group_id: isGroup ? chatId : undefined,
+      user_id: !isGroup ? chatId : undefined,
+      message: messageSegments,
+    })
+    log.info('dispatch', `Sent reply: ${text.slice(0, 100)}`);
+  } catch (error) {
+    log.error('dispatch', `Send failed: ${error}`);
+  }
+}
+
+async function sendMedia(isGroup: boolean, chatId: string, mediaUrl: string): Promise<void> {
+  const content: OpenClawMessage[] = [buildMediaMessage(mediaUrl)];
+
+  try {
+    await sendMsg({
+      message_type: isGroup ? 'group' : 'private',
+      group_id: isGroup ? chatId : undefined,
+      user_id: !isGroup ? chatId : undefined,
+      message: openClawToNapCatMessage(content),
+    });
+    log.info('dispatch', `Sent reply: ${mediaUrl.slice(0, 100)}`);
+  } catch (error) {
+    log.error('dispatch', `Send failed: ${error}`);
+  }
+}
+
+/**
+ * Dispatch an incoming message to the AI for processing
+ */
+export async function dispatchMessage(params: DispatchMessageParams): Promise<void> {
+  let { chatType, chatId, senderId, senderName, messageId, content, media, timestamp, targetId } = params;
+
+  const runtime = getRuntime();
+  if (!runtime) {
+    log.warn('dispatch', `Plugin runtime not available`);
+    return;
+  }
+  const context = getContext();
+  if (!context) {
+    log.warn('dispatch', `No gateway context`);
+    return;
+  }
+
+  const isGroup = chatType === 'group';
+  const config = context.account;
+
+  // At 模式处理
+  if (isGroup && config.groupAtMode) {
+    const loginInfo = getLoginInfo();
+    const hasAtAll = content.includes('[AT]@全体成员');
+    const hasAtMe = loginInfo.userId && content.includes(`[AT]@${loginInfo.userId}`);
+    const hasPoke = content.includes('[动作]') && targetId === loginInfo.userId;
+
+    if (!hasAtAll && !hasAtMe && !hasPoke) {
+      log.debug('dispatch', `Skipping group message (not mentioned)`);
+      recordPendingHistoryEntry({
+        historyMap: historyCache,
+        historyKey: chatId,
+        limit: config.groupHistoryLimit,
+        entry: {
+          sender: `${senderName}(${senderId})`,
+          body: content,
+          timestamp: timestamp,
+          messageId: messageId,
+        },
+      })
+      return;
+    }
+  }
+
+  // === chatAgentMap 查表：优先于 OpenCLaw bindings ===
+  const mappedAgentId = config.chatAgentMap?.[chatId];
+  if (mappedAgentId) {
+    log.info('dispatch', `chatAgentMap matched: ${chatId} -> ${mappedAgentId}`);
+  }
+
+  const { route, buildEnvelope } = resolveInboundRouteEnvelopeBuilderWithRuntime({
+    cfg: context.cfg,
+    channel: CHANNEL_ID,
+    accountId: context.accountId,
+    peer: {
+      kind: isGroup ? ("group" as const) : ("direct" as const),
+      id: chatId,
+    },
+    runtime: runtime.channel,
+    sessionStore: context.cfg.session?.store
+  });
+
+  // 如果 chatAgentMap 命中，覆盖 agentId
+  if (mappedAgentId) {
+    log.info('dispatch', `Overriding agentId: ${route.agentId} -> ${mappedAgentId}`);
+    route.agentId = mappedAgentId;
+  }
+
+  // 终止信号
+  const session = getSession(route.sessionKey);
+  if (session.abortController) {
+    session.abortController.abort();
+    session.aborted = true;
+    log.info('dispatch', `Aborted previous session`)
+  }
+
+  if (isGroup) {
+    content = buildPendingHistoryContextFromMap({
+      historyMap: historyCache,
+      historyKey: chatId,
+      limit: config.groupHistoryLimit,
+      currentMessage: content,
+      formatEntry: (e) => `${e.sender}: ${e.body}`,
+    })
+  }
+
+  const fromLabel = isGroup ? `group:${chatId}` : senderName || `user:${senderId}`;
+  const { storePath, body } = buildEnvelope({
+    channel: CHANNEL_ID,
+    from: fromLabel,
+    body: content,
+    timestamp,
+  });
+  log.debug('dispatch', `Inbound envelope: ${body}`)
+  const fromAddress = `qq:${fromLabel}`;
+  const toAddress = `qq:${chatId}`;
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: body,
+    RawBody: content,
+    CommandBody: content,
+    From: fromAddress,
+    To: toAddress,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isGroup ? 'group' : 'direct',
+    ConversationLabel: fromLabel,
+    SenderId: senderId,
+    SenderName: senderName,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    MessageSid: messageId,
+    Timestamp: timestamp,
+    MediaType: media?.type,
+    MediaPath: media?.path,
+    MediaUrl: media?.url,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: toAddress,
+  });
+
+  log.info('dispatch', `Dispatching to agent ${route.agentId}, session: ${route.sessionKey}`);
+
+  await runtime.channel.session.recordInboundSession({
+    storePath,
+    sessionKey: route.sessionKey,
+    ctx: ctxPayload,
+    onRecordError(err): void {
+      log.error('dispatch', `Failed to record inbound session: ${err}`);
+    },
+  });
+
+  const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(context.cfg, route.agentId);
+  try {
+    session.abortController = new AbortController()
+    updateSession(route.sessionKey, session)
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: context.cfg,
+      dispatcherOptions: {
+        humanDelay: {
+          mode: "off"
+        },
+        responsePrefix: messagesConfig.responsePrefix,
+        onReplyStart: async (): Promise<void> => {
+          if (!isGroup) {
+            // 输入状态
+            await setInputStatus({
+              user_id: senderId,
+              event_type: 1
+            });
+          }
+        },
+        deliver: async (payload: ReplyPayload, info: { kind: string }): Promise<void> => {
+          if (session.aborted) {
+            session.aborted = false;
+            log.info('dispatch', `aborted skipping`)
+            return;
+          }
+
+          if (isGroup) {
+            clearHistoryEntries({ historyMap: historyCache, historyKey: chatId })
+          }
+          log.info('dispatch', `deliver(${info.kind}): ${JSON.stringify(payload)}`);
+
+          if (payload.text && !payload.text.startsWith('MEDIA:')) {
+            await sendText(isGroup, chatId, payload.text);
+          }
+          if (payload.text && payload.text.startsWith('MEDIA:')) {
+            await sendMedia(isGroup, chatId, payload.text.replace('MEDIA:', ''));
+          }
+          if (payload.mediaUrl) {
+            await sendMedia(isGroup, chatId, payload.mediaUrl);
+          }
+          if (payload.mediaUrls && payload.mediaUrls.length > 0) {
+            for (const mediaUrl of payload.mediaUrls) {
+              await sendMedia(isGroup, chatId, mediaUrl);
+            }
+          }
+        },
+        onError: async (err: unknown): Promise<void> => {
+          log.error('dispatch', `Dispatch error: ${err}`);
+          await sendText(isGroup, chatId, `[错误]\n${String(err)}`);
+        },
+      },
+      replyOptions: {
+        abortSignal: session.abortController?.signal,
+      },
+    });
+
+    log.info('dispatch', `Dispatch completed`);
+  } catch (error) {
+    log.error('dispatch', `Message processing failed: ${error}`);
+  } finally {
+    if (!isGroup) {
+      // 输入状态
+      await setInputStatus({
+        user_id: senderId,
+        event_type: 2
+      });
+    }
+    clearSession(route.sessionKey);
+  }
+}
+
+/**
+ * Handle group message event
+ */
+export async function handleGroupMessage(
+  event: {
+    time: number;
+    self_id: number;
+    message_id: number;
+    group_id: number;
+    user_id: number;
+    message: Array<{ type: string; data: Record<string, unknown> }>;
+    raw_message: string;
+    sender?: {
+      nickname?: string;
+      card?: string;
+    };
+  }
+): Promise<void> {
+  const content = await napCatToOpenClawMessage(event.message);
+
+  const plainText = await contentToPlainText(content);
+  const media = await contextToMedia(content);
+
+  log.info('dispatch', `Group message from ${event.sender?.nickname || event.sender?.card || event.user_id}: ${plainText}, media: ${media != undefined}`);
+
+  await dispatchMessage({
+    chatType: 'group',
+    chatId: String(event.group_id),
+    senderId: String(event.user_id),
+    senderName: event.sender?.nickname || event.sender?.card,
+    messageId: String(event.message_id),
+    content: plainText,
+    media,
+    timestamp: event.time * 1000,
+  });
+}
+
+/**
+ * Handle private message event
+ */
+export async function handlePrivateMessage(
+  event: {
+    time: number;
+    self_id: number;
+    message_id: number;
+    user_id: number;
+    message: Array<{ type: string; data: Record<string, unknown> }>;
+    raw_message: string;
+    sender?: {
+      nickname?: string;
+    };
+  }
+): Promise<void> {
+  const content = await napCatToOpenClawMessage(event.message);
+
+  const plainText = await contentToPlainText(content);
+  const media = await contextToMedia(content);
+
+  log.info('dispatch', `Private message from ${event.sender?.nickname || event.user_id}: ${plainText}, media: ${media != undefined}`);
+
+  await dispatchMessage({
+    chatType: 'direct',
+    chatId: String(event.user_id),
+    senderId: String(event.user_id),
+    senderName: event.sender?.nickname,
+    messageId: String(event.message_id),
+    content: plainText,
+    media,
+    timestamp: event.time * 1000,
+  });
+}
+
+/**
+ * Handle poke event
+ */
+function extractPokeActionText(rawInfo?: Array<{ type: string; txt?: string }>): string {
+  if (!rawInfo) return '戳了戳';
+  const actionItem = rawInfo.find(item => item.type === 'nor' && item.txt);
+  return actionItem?.txt || '戳了戳';
+}
+
+export async function handlePokeEvent(
+  event: {
+    user_id: number;
+    target_id: number;
+    group_id?: number;
+    raw_info?: Array<{ type: string; txt?: string }>;
+  }
+): Promise<void> {
+  const actionText = extractPokeActionText(event.raw_info);
+  log.info('dispatch', `Poke from ${event.user_id}: ${actionText}`);
+
+  const pokeMessage = actionText || '戳了戳';
+  const chatType = event.group_id ? 'group' : 'direct';
+  const chatId = String(event.group_id || event.user_id);
+
+  await dispatchMessage({
+    chatType,
+    chatId,
+    senderId: String(event.user_id),
+    senderName: String(event.user_id),
+    messageId: `poke_${event.user_id}_${Date.now()}`,
+    content: `[动作]${pokeMessage}`,
+    timestamp: Date.now(),
+    targetId: String(event.target_id),
+  });
+}

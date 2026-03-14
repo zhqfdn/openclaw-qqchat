@@ -1,0 +1,11 @@
+{
+  "id": "qqchat",
+  "name": "QQChat",
+  "channels": ["qqchat"],
+  "description": "QQChat channel plugin for OpenClaw using NapCat WebSocket API",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

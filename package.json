@@ -1,0 +1,62 @@
+{
+  "name": "@qcluffy/qqchat",
+  "version": "0.0.1",
+  "description": "QQChat channel plugin for OpenClaw using NapCat WebSocket",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "openclaw.plugin.json"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "tsc --watch",
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "release:patch": "npm version patch && npm publish --access public",
+    "release:minor": "npm version minor && npm publish --access public",
+    "release:major": "npm version major && npm publish --access public",
+    "release": "npm run release:patch"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "qqchat"
+  ],
+  "author": "qcluffy",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "@qcluffy/qqchat",
+      "localPath": "extensions/qqchat",
+      "defaultChoice": "npm"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": "^2026.3.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "p-limit": "^7.3.0",
+    "ws": "^8.19.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.0",
+    "openclaw": "^2026.3.1",
+    "typescript": "^5.0.0"
+  }
+}
